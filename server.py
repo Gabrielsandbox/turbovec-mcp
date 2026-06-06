@@ -5,7 +5,6 @@ Exposes vector-search tools to Claude Code via the Model Context Protocol.
 
 import sys
 import json
-import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -14,6 +13,7 @@ from mcp.server.fastmcp import FastMCP
 sys.path.insert(0, str(Path(__file__).parent))
 from indexer import VectorDB
 from embeddings import make_provider, PROVIDERS
+from deploy import export_archive, import_archive, upload_cloud, download_cloud, copy_local
 
 # ------------------------------------------------------------------ #
 # Database management                                                  #
@@ -222,29 +222,160 @@ def tv_list_providers() -> str:
 
 
 @mcp.tool()
-def tv_deploy(name: str, source: str = "default", output_path: Optional[str] = None) -> str:
+def tv_deploy(
+    source: str = "default",
+    name: Optional[str] = None,
+    target: str = "local",
+    output_path: Optional[str] = None,
+) -> str:
     """
-    Deploy (export/copy) a named vector database to a destination.
-    Useful for sharing indexes or deploying to another machine.
-    source: name of the database to export (default: 'default')
-    output_path: optional absolute path; defaults to ~/.turbovec/<name>
+    Deploy a vector database to a local copy, archive, or cloud storage.
+
+    target options:
+      "local"           Copy files to a new name in ~/.turbovec/ (default).
+                        Requires: name
+      "archive"         Bundle into a portable .tar.gz file.
+                        output_path sets the file location (default: ~/.turbovec/<source>.tar.gz)
+      "s3://bucket/prefix"    Upload to Amazon S3       (requires: pip install boto3)
+      "gs://bucket/prefix"    Upload to Google Cloud Storage  (requires: pip install google-cloud-storage)
+      "azure://container/prefix"  Upload to Azure Blob   (requires: pip install azure-storage-blob;
+                                                            AZURE_STORAGE_CONNECTION_STRING env var)
+
+    Examples:
+      tv_deploy(source="mydb", name="mydb-backup")
+      tv_deploy(source="mydb", target="archive", output_path="/tmp/mydb.tar.gz")
+      tv_deploy(source="mydb", target="s3://my-bucket/indexes")
+      tv_deploy(source="mydb", target="gs://my-bucket/indexes")
     """
-    src_base = BASE_DIR / source
-    dst_dir = Path(output_path) if output_path else BASE_DIR
-    dst_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        if target == "local":
+            if not name:
+                return "Error: 'name' is required for local deployment."
+            files = copy_local(source, name, output_path)
+            return f"Copied '{source}' → '{name}'\n" + "\n".join(f"  {f}" for f in files)
 
-    copied = []
-    for ext in (".tvim", ".json"):
-        src = src_base.with_suffix(ext)
-        if src.exists():
-            dst = dst_dir / (name + ext)
-            shutil.copy2(src, dst)
-            copied.append(str(dst))
+        elif target == "archive":
+            out = export_archive(source, output_path)
+            return f"Archive created: {out}"
 
-    if not copied:
-        return f"Source database '{source}' not found."
+        else:
+            # cloud target
+            uris = upload_cloud(source, target)
+            return f"Uploaded '{source}' to {target}\n" + "\n".join(f"  {u}" for u in uris)
 
-    return f"Deployed '{source}' → '{name}'\n" + "\n".join(f"  {f}" for f in copied)
+    except (FileNotFoundError, ValueError, ImportError) as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def tv_import(
+    source: str,
+    db_name: Optional[str] = None,
+) -> str:
+    """
+    Import a database from an archive file or cloud storage.
+
+    source can be:
+      /path/to/file.tar.gz              local archive
+      s3://bucket/prefix/name.tar.gz    S3 archive object
+      gs://bucket/prefix/name.tar.gz    GCS archive object
+      azure://container/prefix/name.tar.gz  Azure archive blob
+      s3://bucket/prefix/name           S3 raw files (no .tar.gz)
+      gs://bucket/prefix/name           GCS raw files
+      azure://container/prefix/name     Azure raw files
+
+    db_name overrides the name embedded in the archive or URI.
+    """
+    try:
+        is_cloud = any(source.startswith(p) for p in ("s3://", "gs://", "azure://"))
+
+        if is_cloud and source.endswith(".tar.gz"):
+            # download archive to temp, then import
+            import tempfile
+            provider, bucket, key = _parse_cloud_uri(source)
+            with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+                tmp_path = tmp.name
+            _download_single_file(provider, bucket, key, tmp_path)
+            name = import_archive(tmp_path, db_name)
+            Path(tmp_path).unlink(missing_ok=True)
+
+        elif is_cloud:
+            name = download_cloud(source, db_name)
+
+        else:
+            name = import_archive(source, db_name)
+
+        db = VectorDB(str(BASE_DIR / name))
+        s = db.stats()
+        emb = s["embedding"]
+        return (
+            f"Imported database '{name}'. "
+            f"{s['files_indexed']} files · {s['total_chunks']} chunks. "
+            f"Embedding: {emb['provider']} / {emb['model']}"
+        )
+    except (FileNotFoundError, ValueError, ImportError) as e:
+        return f"Error: {e}"
+
+
+@mcp.tool()
+def tv_http_server_info(db_name: Optional[str] = None) -> str:
+    """
+    Show how to start the TurboVec HTTP server for a given database.
+    The HTTP server exposes a REST API so other processes or machines can query the index.
+    """
+    db = db_name or _active_name
+    lines = [
+        f"To serve database '{db}' over HTTP, run in a terminal:",
+        "",
+        f"  python http_server.py --db {db} --port 8000",
+        "",
+        "Or via the CLI:",
+        f"  python cli.py serve-http --db {db} --port 8000",
+        "",
+        "To require a write key for indexing endpoints:",
+        f"  python cli.py serve-http --db {db} --port 8000 --write-key mysecret",
+        "",
+        "Endpoints once running:",
+        "  GET  http://localhost:8000/health",
+        "  GET  http://localhost:8000/stats",
+        "  GET  http://localhost:8000/dbs",
+        "  POST http://localhost:8000/search   {query, top_k, filter_files}",
+        "  POST http://localhost:8000/index    {path, recursive}  [write key]",
+        "  DELETE http://localhost:8000/file   {file_path}        [write key]",
+        "",
+        "Interactive docs: http://localhost:8000/docs",
+    ]
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------ #
+# Internal helpers for tv_import cloud archive                         #
+# ------------------------------------------------------------------ #
+
+def _parse_cloud_uri(uri: str):
+    for scheme, provider in [("s3://", "s3"), ("gs://", "gcs"), ("azure://", "azure")]:
+        if uri.startswith(scheme):
+            rest = uri[len(scheme):]
+            bucket, _, key = rest.partition("/")
+            return provider, bucket, key
+    raise ValueError(f"Unsupported URI: {uri}")
+
+
+def _download_single_file(provider: str, bucket: str, key: str, dest: str):
+    if provider == "s3":
+        import boto3
+        boto3.client("s3").download_file(bucket, key, dest)
+    elif provider == "gcs":
+        from google.cloud import storage as gcs
+        gcs.Client().bucket(bucket).blob(key).download_to_filename(dest)
+    elif provider == "azure":
+        import os
+        from azure.storage.blob import BlobServiceClient
+        conn = os.environ.get("AZURE_STORAGE_CONNECTION_STRING")
+        svc = BlobServiceClient.from_connection_string(conn)
+        Path(dest).write_bytes(
+            svc.get_container_client(bucket).get_blob_client(key).download_blob().readall()
+        )
 
 
 # ------------------------------------------------------------------ #

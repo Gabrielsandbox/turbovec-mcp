@@ -7,5 +7,13 @@ typer>=0.12
 # Local embeddings (default provider)
 sentence-transformers>=3.0
 
+# HTTP server (optional — only needed for serve-http / http_server.py)
+# pip install fastapi uvicorn[standard]
+
 # OpenAI embeddings (optional — only needed if using --provider openai)
 # pip install openai
+
+# Cloud storage — install only what you need:
+# pip install boto3                  # Amazon S3
+# pip install google-cloud-storage   # Google Cloud Storage
+# pip install azure-storage-blob     # Azure Blob Storage

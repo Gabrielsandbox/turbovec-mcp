@@ -5,7 +5,11 @@ Usage:
   python cli.py create-db <name>          # create db with chosen embedding provider
   python cli.py index <path>              # index a file or directory
   python cli.py search "query"            # semantic search
-  python cli.py deploy <name>             # export/deploy a database
+  python cli.py deploy <name>             # local copy
+  python cli.py deploy --target archive   # export as .tar.gz
+  python cli.py deploy --target s3://...  # upload to S3 / GCS / Azure
+  python cli.py import-db <source>        # import from archive or cloud
+  python cli.py serve-http                # start REST HTTP server
   python cli.py list-dbs                  # show all databases + their providers
   python cli.py providers                 # list available embedding providers
   python cli.py stats                     # show active db stats
@@ -16,7 +20,6 @@ Usage:
 
 import sys
 import json
-import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +28,7 @@ import typer
 sys.path.insert(0, str(Path(__file__).parent))
 from indexer import VectorDB
 from embeddings import make_provider, PROVIDERS
+from deploy import export_archive, import_archive, upload_cloud, download_cloud, copy_local
 
 BASE_DIR = Path.home() / ".turbovec"
 app = typer.Typer(
@@ -196,30 +200,121 @@ def search(
 
 @app.command()
 def deploy(
-    name: str = typer.Argument(..., help="Name for the exported database"),
-    source: str = typer.Option("default", "--source", "-s", help="Source database"),
-    output: Optional[str] = typer.Option(None, "--output", "-o", help="Output directory"),
+    name: Optional[str] = typer.Argument(None, help="Destination name (required for local target)"),
+    source: str = typer.Option("default", "--source", "-s", help="Source database name"),
+    target: str = typer.Option("local", "--target", "-t",
+        help="Deployment target: 'local', 'archive', 's3://bucket/prefix', 'gs://...', 'azure://...'"),
+    output: Optional[str] = typer.Option(None, "--output", "-o",
+        help="Output path for local copy dir or archive file"),
 ):
-    """Export a vector database to a named copy or path."""
-    src_base = BASE_DIR / source
-    dst_dir = Path(output) if output else BASE_DIR
-    dst_dir.mkdir(parents=True, exist_ok=True)
+    """
+    Deploy a database to a local copy, archive, or cloud storage.
 
-    copied = []
-    for ext in (".tvim", ".json"):
-        src = src_base.with_suffix(ext)
-        if src.exists():
-            dst = dst_dir / (name + ext)
-            shutil.copy2(src, dst)
-            copied.append(str(dst))
+    Examples:
+      python cli.py deploy backup --source mydb
+      python cli.py deploy --source mydb --target archive --output /tmp/mydb.tar.gz
+      python cli.py deploy --source mydb --target s3://my-bucket/indexes
+      python cli.py deploy --source mydb --target gs://my-bucket/indexes
+      python cli.py deploy --source mydb --target azure://my-container/indexes
+    """
+    try:
+        if target == "local":
+            if not name:
+                typer.echo("✗ Provide a destination name: python cli.py deploy <name>", err=True)
+                raise typer.Exit(1)
+            files = copy_local(source, name, output)
+            typer.echo(f"✓ Copied '{source}' → '{name}'")
+            for f in files:
+                typer.echo(f"  {f}")
 
-    if not copied:
-        typer.echo(f"✗ Source database '{source}' not found.", err=True)
+        elif target == "archive":
+            out = export_archive(source, output)
+            typer.echo(f"✓ Archive created: {out}")
+
+        else:
+            # cloud
+            uris = upload_cloud(source, target)
+            typer.echo(f"✓ Uploaded '{source}' to {target}")
+            for u in uris:
+                typer.echo(f"  {u}")
+
+    except (FileNotFoundError, ValueError, ImportError) as e:
+        typer.echo(f"✗ {e}", err=True)
         raise typer.Exit(1)
 
-    typer.echo(f"✓ Deployed '{source}' → '{name}'")
-    for f in copied:
-        typer.echo(f"  {f}")
+
+@app.command("import-db")
+def import_db(
+    source: str = typer.Argument(...,
+        help="Archive path or cloud URI (s3://, gs://, azure://)"),
+    db_name: Optional[str] = typer.Option(None, "--name", "-n",
+        help="Override the database name (default: inferred from archive/URI)"),
+):
+    """
+    Import a database from a local archive or cloud storage.
+
+    Examples:
+      python cli.py import-db /tmp/mydb.tar.gz
+      python cli.py import-db /tmp/mydb.tar.gz --name newname
+      python cli.py import-db s3://my-bucket/indexes/mydb.tar.gz
+      python cli.py import-db gs://my-bucket/indexes/mydb
+      python cli.py import-db azure://my-container/indexes/mydb
+    """
+    try:
+        is_cloud = any(source.startswith(p) for p in ("s3://", "gs://", "azure://"))
+
+        if is_cloud and source.endswith(".tar.gz"):
+            import tempfile
+            from deploy import _parse_uri, _download_single_cloud_file
+            provider, bucket, key = _parse_uri(source)
+            with tempfile.NamedTemporaryFile(suffix=".tar.gz", delete=False) as tmp:
+                tmp_path = tmp.name
+            _download_single_cloud_file(provider, bucket, key, tmp_path)
+            name = import_archive(tmp_path, db_name)
+            Path(tmp_path).unlink(missing_ok=True)
+        elif is_cloud:
+            name = download_cloud(source, db_name)
+        else:
+            name = import_archive(source, db_name)
+
+        vdb = VectorDB(str(BASE_DIR / name))
+        s = vdb.stats()
+        emb = s["embedding"]
+        typer.echo(f"✓ Imported '{name}'")
+        typer.echo(f"  Files: {s['files_indexed']}  Chunks: {s['total_chunks']}")
+        typer.echo(f"  Embedding: {emb['provider']} / {emb['model']}  dim={emb['dim']}")
+
+    except (FileNotFoundError, ValueError, ImportError) as e:
+        typer.echo(f"✗ {e}", err=True)
+        raise typer.Exit(1)
+
+
+@app.command("serve-http")
+def serve_http(
+    db: str = typer.Option("default", "--db", "-d", help="Database to serve"),
+    host: str = typer.Option("0.0.0.0", "--host", help="Bind address"),
+    port: int = typer.Option(8000, "--port", "-p", help="Port number"),
+    write_key: Optional[str] = typer.Option(None, "--write-key",
+        help="Bearer token required for write endpoints (index, delete). "
+             "If not set, write endpoints are open."),
+):
+    """
+    Start the TurboVec HTTP REST server.
+
+    Exposes the vector index over HTTP so any process or machine can query it.
+    Interactive API docs available at http://localhost:<port>/docs once running.
+
+    Examples:
+      python cli.py serve-http --db myproject
+      python cli.py serve-http --db myproject --port 9000 --write-key mysecret
+    """
+    try:
+        import http_server as hs
+    except ImportError:
+        typer.echo("✗ HTTP server requires: pip install fastapi uvicorn[standard]", err=True)
+        raise typer.Exit(1)
+
+    hs.serve(db_name=db, host=host, port=port, write_key=write_key)
 
 
 @app.command("list-dbs")

@@ -98,6 +98,90 @@ Subclass `EmbeddingProvider` in [`embeddings.py`](embeddings.py), implement `emb
 
 ---
 
+## Deployment
+
+Three deployment modes are supported. All are available from both the CLI and from within Claude Code via MCP tools.
+
+### 1. Archive (.tar.gz)
+
+Bundle the index into a single portable file — easy to share, attach to releases, or copy between machines.
+
+```bash
+# Export
+python cli.py deploy --source mydb --target archive --output /tmp/mydb.tar.gz
+
+# Import on another machine
+python cli.py import-db /tmp/mydb.tar.gz
+python cli.py import-db /tmp/mydb.tar.gz --name newname
+```
+
+### 2. Cloud storage
+
+Upload and download to S3, Google Cloud Storage, or Azure Blob Storage. Install only the SDK you need:
+
+```bash
+pip install boto3                 # Amazon S3
+pip install google-cloud-storage  # Google Cloud Storage
+pip install azure-storage-blob    # Azure Blob Storage
+```
+
+```bash
+# Upload to S3
+python cli.py deploy --source mydb --target s3://my-bucket/indexes
+
+# Upload to GCS
+python cli.py deploy --source mydb --target gs://my-bucket/indexes
+
+# Upload to Azure (requires AZURE_STORAGE_CONNECTION_STRING env var)
+python cli.py deploy --source mydb --target azure://my-container/indexes
+
+# Download from any cloud
+python cli.py import-db s3://my-bucket/indexes/mydb
+python cli.py import-db gs://my-bucket/indexes/mydb
+python cli.py import-db s3://my-bucket/indexes/mydb.tar.gz  # archive object
+```
+
+Cloud credentials are read from the environment automatically:
+- **S3**: `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, or `~/.aws/credentials`
+- **GCS**: `GOOGLE_APPLICATION_CREDENTIALS`
+- **Azure**: `AZURE_STORAGE_CONNECTION_STRING`
+
+### 3. HTTP server
+
+Serve a database over REST so any process or machine can query it — no local index required on the client.
+
+```bash
+pip install fastapi uvicorn[standard]
+
+# Start the server
+python cli.py serve-http --db mydb --port 8000
+
+# Protect write endpoints with a bearer token
+python cli.py serve-http --db mydb --port 8000 --write-key mysecret
+```
+
+**Endpoints:**
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| `GET` | `/health` | — | Liveness check |
+| `GET` | `/stats` | — | Index stats + provider info |
+| `GET` | `/dbs` | — | List all databases |
+| `POST` | `/search` | — | `{query, top_k, filter_files}` |
+| `POST` | `/index` | write key | `{path, recursive}` |
+| `DELETE` | `/file` | write key | `{file_path}` |
+
+Interactive docs at `http://localhost:8000/docs` once running.
+
+**Query from anywhere:**
+```bash
+curl -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  -d '{"query": "JWT authentication", "top_k": 5}'
+```
+
+---
+
 ## MCP tools
 
 All tools are available inside Claude Code once the server is running.
@@ -112,7 +196,9 @@ All tools are available inside Claude Code once the server is running.
 | `tv_use_db` | Switch to a different database (provider auto-restored) |
 | `tv_list_dbs` | List all databases with their embedding provider and model |
 | `tv_list_providers` | List all available providers and models |
-| `tv_deploy` | Export/copy a named database for sharing or deployment |
+| `tv_deploy` | Deploy to local copy, `.tar.gz` archive, S3, GCS, or Azure |
+| `tv_import` | Import from a local archive or cloud URI |
+| `tv_http_server_info` | Show how to start the HTTP server for a database |
 
 ---
 
@@ -145,9 +231,24 @@ python cli.py use myproject     # verify db exists and print its stats
 # Manage files
 python cli.py remove ./file.py --db myproject
 
-# Export / deploy
-python cli.py deploy production --source myproject
-python cli.py deploy production --source myproject --output /shared/indexes/
+# Deploy — local copy
+python cli.py deploy backup --source myproject
+
+# Deploy — archive
+python cli.py deploy --source myproject --target archive --output /tmp/myproject.tar.gz
+
+# Deploy — cloud
+python cli.py deploy --source myproject --target s3://my-bucket/indexes
+python cli.py deploy --source myproject --target gs://my-bucket/indexes
+python cli.py deploy --source myproject --target azure://my-container/indexes
+
+# Import
+python cli.py import-db /tmp/myproject.tar.gz
+python cli.py import-db s3://my-bucket/indexes/myproject
+
+# HTTP server
+python cli.py serve-http --db myproject --port 8000
+python cli.py serve-http --db myproject --port 8000 --write-key mysecret
 
 # Start the MCP server manually
 python cli.py serve
@@ -161,7 +262,9 @@ python cli.py serve
 turbovec-mcp/
 ├── embeddings.py    # EmbeddingProvider ABC + SentenceTransformer + OpenAI providers
 ├── indexer.py       # VectorDB: chunk → embed → IdMapIndex → persist
-├── server.py        # FastMCP server — 9 tools exposed to Claude Code
+├── deploy.py        # Archive export/import + S3 / GCS / Azure upload/download
+├── http_server.py   # FastAPI REST server (serve-http)
+├── server.py        # FastMCP server — 11 MCP tools exposed to Claude Code
 ├── cli.py           # Typer CLI for terminal use
 ├── requirements.txt
 ├── pyproject.toml
