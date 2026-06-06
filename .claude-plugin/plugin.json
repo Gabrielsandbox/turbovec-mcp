@@ -1,0 +1,12 @@
+{
+  "name": "turbovec",
+  "description": "High-performance RAG for Claude Code — index any file type, semantic search with file paths and line numbers, deploy named vector databases from the CLI. Powered by Google's TurboQuant algorithm via TurboVec (Rust, 87% less memory than FAISS).",
+  "author": {
+    "name": "Blumel-SIM",
+    "url": "https://github.com/Blumel-SIM"
+  },
+  "version": "0.1.0",
+  "category": "development",
+  "homepage": "https://github.com/Blumel-SIM/turbovec-mcp",
+  "tags": ["rag", "vector-search", "embeddings", "search", "files", "semantic-search"]
+}

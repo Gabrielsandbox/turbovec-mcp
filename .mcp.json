@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "turbovec": {
+      "command": "python",
+      "args": ["${PLUGIN_DIR}/server.py"],
+      "env": {}
+    }
+  }
+}
