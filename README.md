@@ -43,46 +43,26 @@ The auth layer validates JWTs issued by Supabase Auth...
 
 ## Installation
 
-### As a Claude Code plugin
-
 ```bash
-/plugin install turbovec@anthropic-community
-```
-
-Or add manually to your `.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "turbovec": {
-      "command": "python",
-      "args": ["${PLUGIN_DIR}/server.py"]
-    }
-  }
-}
-```
-
-### Manual setup
-
-```bash
-git clone https://github.com/Blumel-SIM/turbovec-mcp
+git clone https://github.com/Gabrielsandbox/turbovec-mcp
 cd turbovec-mcp
 pip install -r requirements.txt
 ```
 
-Then add to your `.mcp.json`:
+Add the server to your project's `.mcp.json` (replace the path with where you cloned):
+
 ```json
 {
   "mcpServers": {
     "turbovec": {
       "command": "python",
-      "args": ["/absolute/path/to/turbovec-mcp/server.py"]
+      "args": ["/path/to/turbovec-mcp/server.py"]
     }
   }
 }
 ```
 
-Restart Claude Code. The `turbovec` server will appear in your MCP list.
+Restart Claude Code. The `turbovec` server will appear in your MCP tool list automatically.
 
 ---
 
@@ -122,6 +102,9 @@ python cli.py list-dbs
 
 # Show index stats
 python cli.py stats --db myproject
+
+# Verify a database exists and check its stats
+python cli.py use myproject
 ```
 
 ---
@@ -160,9 +143,9 @@ python cli.py index ~/code/api --db api
 python cli.py index ~/vault --db notes
 python cli.py index ~/docs --db docs
 
-# Switch inside Claude Code
-tv_use_db("api")
-tv_use_db("notes")
+# Switch active database inside Claude Code (MCP tool)
+# Ask Claude: "switch to the api database"
+# Claude calls: tv_use_db with name="api"
 ```
 
 ---
@@ -200,6 +183,6 @@ MIT — see [LICENSE](LICENSE).
 
 Issues and PRs welcome. To add support for a new file type, add its extension to `SUPPORTED_EXTENSIONS` in [indexer.py](indexer.py).
 
-Sources:
-- [TurboVec GitHub](https://github.com/RyanCodrai/turbovec)
-- [Anthropic Plugin Directory](https://github.com/anthropics/claude-plugins-official)
+---
+
+Built on [TurboVec](https://github.com/RyanCodrai/turbovec) by Ryan Codrai — Rust vector index using Google Research's TurboQuant (ICLR 2026).

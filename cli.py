@@ -9,7 +9,7 @@ Usage:
   python cli.py list-dbs                  # show all databases
   python cli.py stats                     # show active db stats
   python cli.py remove <file>             # remove a file from the index
-  python cli.py use <db-name>             # set active database
+  python cli.py use <db-name>             # print the switch command (use tv_use_db in Claude Code)
 """
 
 import sys
@@ -173,6 +173,31 @@ def remove(
     vdb.remove_file(file_path)
     vdb.save()
     typer.echo(f"✓ Removed '{file_path}' from '{db}'")
+
+
+@app.command()
+def use(
+    db_name: str = typer.Argument(..., help="Database name to switch to"),
+):
+    """
+    Switch the active database for future CLI commands.
+    Verifies the database exists and prints its stats.
+    (Inside Claude Code, use the tv_use_db MCP tool instead.)
+    """
+    db_path = BASE_DIR / db_name
+    if not db_path.with_suffix(".tvim").exists():
+        typer.echo(f"✗ Database '{db_name}' not found in {BASE_DIR}", err=True)
+        typer.echo("Available databases:")
+        dbs = sorted({f.stem for f in BASE_DIR.glob("*.tvim")})
+        for d in dbs:
+            typer.echo(f"  • {d}")
+        raise typer.Exit(1)
+
+    vdb = _get_db(db_name)
+    s = vdb.stats()
+    typer.echo(f"✓ Database '{db_name}' is ready")
+    typer.echo(f"  Files: {s['files_indexed']}  Chunks: {s['total_chunks']}")
+    typer.echo(f"  Index: {s['index_file']}")
 
 
 if __name__ == "__main__":
