@@ -1,5 +1,11 @@
+# Core
 turbovec
-sentence-transformers>=3.0
 numpy>=1.26
 mcp[cli]>=1.0
 typer>=0.12
+
+# Local embeddings (default provider)
+sentence-transformers>=3.0
+
+# OpenAI embeddings (optional — only needed if using --provider openai)
+# pip install openai

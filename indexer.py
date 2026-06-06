@@ -3,6 +3,8 @@ import numpy as np
 from pathlib import Path
 from typing import Optional
 
+from embeddings import EmbeddingProvider, DEFAULT_PROVIDER, load_provider
+
 SUPPORTED_EXTENSIONS = {
     ".md", ".txt", ".py", ".js", ".ts", ".jsx", ".tsx",
     ".json", ".yaml", ".yml", ".toml", ".html", ".css",
@@ -10,53 +12,48 @@ SUPPORTED_EXTENSIONS = {
     ".csv", ".xml", ".sql",
 }
 
-CHUNK_SIZE = 400   # lines-worth of chars before splitting
-CHUNK_OVERLAP = 60 # chars to carry over for context continuity
+CHUNK_SIZE = 400
+CHUNK_OVERLAP = 60
 
 
 class VectorDB:
     """
     Wraps a TurboVec IdMapIndex with a JSON metadata sidecar.
-    Stores: index (.tvim) + metadata (.json) at db_path.{ext}
+
+    The embedding provider is chosen at creation time and stored in the
+    metadata sidecar so the index can be reopened without re-specifying it.
+    Mixing providers on the same index is rejected at index time.
+
+    Files: <db_path>.tvim (vectors) + <db_path>.json (metadata + config)
     """
 
-    DIM = 384  # all-MiniLM-L6-v2 output dimension
-
-    def __init__(self, db_path: str, bit_width: int = 4):
+    def __init__(self, db_path: str, provider: Optional[EmbeddingProvider] = None, bit_width: int = 4):
         self.db_path = Path(db_path)
         self.bit_width = bit_width
         self.index_file = self.db_path.with_suffix(".tvim")
         self.meta_file = self.db_path.with_suffix(".json")
-        self._model = None
 
         if self.index_file.exists() and self.meta_file.exists():
             from turbovec import IdMapIndex
             self.index = IdMapIndex.load(str(self.index_file))
             raw = json.loads(self.meta_file.read_text(encoding="utf-8"))
-            self.metadata: dict[str, dict] = raw["chunks"]   # str(id) -> chunk info
-            self.file_ids: dict[str, list[int]] = raw["file_ids"]  # file -> [ids]
+            self.metadata: dict[str, dict] = raw["chunks"]
+            self.file_ids: dict[str, list[int]] = raw["file_ids"]
             self.next_id: int = raw["next_id"]
+            # restore the provider that was used when this index was created
+            stored = raw.get("embedding")
+            if stored:
+                self.provider = load_provider(stored)
+            else:
+                # legacy index without stored provider — default to sentence-transformers
+                self.provider = provider or DEFAULT_PROVIDER
         else:
             from turbovec import IdMapIndex
-            self.index = IdMapIndex(dim=self.DIM, bit_width=bit_width)
+            self.provider = provider or DEFAULT_PROVIDER
+            self.index = IdMapIndex(dim=self.provider.dim, bit_width=bit_width)
             self.metadata = {}
             self.file_ids = {}
             self.next_id = 1
-
-    # ------------------------------------------------------------------ #
-    # Embedding                                                            #
-    # ------------------------------------------------------------------ #
-
-    def _get_model(self):
-        if self._model is None:
-            from sentence_transformers import SentenceTransformer
-            self._model = SentenceTransformer("all-MiniLM-L6-v2")
-        return self._model
-
-    def _embed(self, texts: list[str]) -> np.ndarray:
-        return self._get_model().encode(
-            texts, normalize_embeddings=True, show_progress_bar=False
-        ).astype(np.float32)
 
     # ------------------------------------------------------------------ #
     # Chunking                                                             #
@@ -75,7 +72,6 @@ class VectorDB:
             buf_len += len(line) + 1
             if buf_len >= CHUNK_SIZE:
                 chunks.append(("\n".join(buf), start, i))
-                # keep a small overlap tail
                 tail: list[str] = []
                 tail_len = 0
                 for l in reversed(buf):
@@ -109,7 +105,7 @@ class VectorDB:
         if not chunks:
             return 0
 
-        vectors = self._embed([c[0] for c in chunks])
+        vectors = self.provider.embed([c[0] for c in chunks])
         new_ids = list(range(self.next_id, self.next_id + len(chunks)))
         self.next_id += len(chunks)
 
@@ -162,7 +158,7 @@ class VectorDB:
         top_k: int = 5,
         filter_files: Optional[list[str]] = None,
     ) -> list[dict]:
-        vec = self._embed([query])[0]
+        vec = self.provider.embed([query])[0]
 
         if filter_files:
             allowed_ids: list[int] = []
@@ -179,15 +175,13 @@ class VectorDB:
         results = []
         for score, vid in zip(scores, ids):
             meta = self.metadata.get(str(int(vid)), {})
-            results.append(
-                {
-                    "score": float(score),
-                    "file": meta.get("file", ""),
-                    "text": meta.get("text", ""),
-                    "start_line": meta.get("start_line", 0),
-                    "end_line": meta.get("end_line", 0),
-                }
-            )
+            results.append({
+                "score": float(score),
+                "file": meta.get("file", ""),
+                "text": meta.get("text", ""),
+                "start_line": meta.get("start_line", 0),
+                "end_line": meta.get("end_line", 0),
+            })
         return results
 
     # ------------------------------------------------------------------ #
@@ -199,7 +193,12 @@ class VectorDB:
         self.index.write(str(self.index_file))
         self.meta_file.write_text(
             json.dumps(
-                {"next_id": self.next_id, "chunks": self.metadata, "file_ids": self.file_ids},
+                {
+                    "next_id": self.next_id,
+                    "chunks": self.metadata,
+                    "file_ids": self.file_ids,
+                    "embedding": self.provider.to_dict(),
+                },
                 ensure_ascii=False,
                 indent=2,
             ),
@@ -210,7 +209,7 @@ class VectorDB:
         return {
             "files_indexed": len(self.file_ids),
             "total_chunks": len(self.metadata),
-            "dim": self.DIM,
+            "embedding": self.provider.to_dict(),
             "bit_width": self.bit_width,
             "index_file": str(self.index_file),
             "meta_file": str(self.meta_file),

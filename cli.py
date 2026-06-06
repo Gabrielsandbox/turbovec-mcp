@@ -2,14 +2,16 @@
 turbovec CLI — manage vector databases from the command line.
 
 Usage:
-  python cli.py serve                     # start the MCP server
+  python cli.py create-db <name>          # create db with chosen embedding provider
   python cli.py index <path>              # index a file or directory
   python cli.py search "query"            # semantic search
   python cli.py deploy <name>             # export/deploy a database
-  python cli.py list-dbs                  # show all databases
+  python cli.py list-dbs                  # show all databases + their providers
+  python cli.py providers                 # list available embedding providers
   python cli.py stats                     # show active db stats
   python cli.py remove <file>             # remove a file from the index
-  python cli.py use <db-name>             # print the switch command (use tv_use_db in Claude Code)
+  python cli.py use <db-name>             # verify a database and show its stats
+  python cli.py serve                     # start the MCP server
 """
 
 import sys
@@ -22,6 +24,7 @@ import typer
 
 sys.path.insert(0, str(Path(__file__).parent))
 from indexer import VectorDB
+from embeddings import make_provider, PROVIDERS
 
 BASE_DIR = Path.home() / ".turbovec"
 app = typer.Typer(
@@ -30,10 +33,14 @@ app = typer.Typer(
     add_completion=False,
 )
 
+PROVIDER_HELP = "Embedding provider: sentence-transformers (local) or openai (API)"
+MODEL_HELP = "Model name for the provider (uses provider default if omitted)"
 
-def _get_db(db: str) -> VectorDB:
+
+def _get_db(db: str, provider_name: Optional[str] = None, model: Optional[str] = None) -> VectorDB:
     BASE_DIR.mkdir(parents=True, exist_ok=True)
-    return VectorDB(str(BASE_DIR / db))
+    provider = make_provider(provider_name, model) if provider_name else None
+    return VectorDB(str(BASE_DIR / db), provider=provider)
 
 
 # ------------------------------------------------------------------ #
@@ -47,6 +54,72 @@ def serve():
     srv.mcp.run()
 
 
+@app.command("create-db")
+def create_db(
+    name: str = typer.Argument(..., help="Name for the new database"),
+    provider: str = typer.Option("sentence-transformers", "--provider", "-p", help=PROVIDER_HELP),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help=MODEL_HELP),
+):
+    """
+    Create a new named vector database with a specific embedding provider.
+
+    Examples:
+      python cli.py create-db myproject
+      python cli.py create-db myproject --provider openai --model text-embedding-3-large
+      python cli.py create-db multilingual --model paraphrase-multilingual-MiniLM-L12-v2
+    """
+    db_path = BASE_DIR / name
+    if db_path.with_suffix(".tvim").exists():
+        typer.echo(f"✗ Database '{name}' already exists. Use: python cli.py use {name}", err=True)
+        raise typer.Exit(1)
+
+    try:
+        emb_provider = make_provider(provider, model)
+    except (ValueError, ImportError) as e:
+        typer.echo(f"✗ {e}", err=True)
+        raise typer.Exit(1)
+
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    vdb = VectorDB(str(db_path), provider=emb_provider)
+    vdb.save()
+    s = vdb.stats()
+    emb = s["embedding"]
+    typer.echo(f"✓ Created '{name}'")
+    typer.echo(f"  Provider : {emb['provider']}")
+    typer.echo(f"  Model    : {emb['model']}")
+    typer.echo(f"  Dim      : {emb['dim']}")
+
+
+@app.command()
+def providers():
+    """List all available embedding providers and their models."""
+    typer.echo("\nsentence-transformers  (local, offline)\n")
+    models = [
+        ("all-MiniLM-L6-v2",                        "384d",  "fast, general-purpose  [default]"),
+        ("all-MiniLM-L12-v2",                        "384d",  "slightly better recall than L6"),
+        ("all-mpnet-base-v2",                         "768d",  "higher quality, slower"),
+        ("BAAI/bge-small-en-v1.5",                   "384d",  "fast, strong retrieval"),
+        ("BAAI/bge-base-en-v1.5",                    "768d",  "strong retrieval, balanced"),
+        ("BAAI/bge-large-en-v1.5",                   "1024d", "best retrieval, heavier"),
+        ("intfloat/e5-small-v2",                     "384d",  "lightweight"),
+        ("intfloat/e5-base-v2",                      "768d",  "balanced"),
+        ("intfloat/e5-large-v2",                     "1024d", "best quality"),
+        ("paraphrase-multilingual-MiniLM-L12-v2",    "384d",  "multilingual"),
+    ]
+    for m, d, note in models:
+        typer.echo(f"  {m:<48} {d:<6}  {note}")
+
+    typer.echo("\nopenai  (API — requires OPENAI_API_KEY)\n")
+    oai_models = [
+        ("text-embedding-3-small",  "1536d", "fast, cheap  [default]"),
+        ("text-embedding-3-large",  "3072d", "highest quality"),
+        ("text-embedding-ada-002",  "1536d", "legacy"),
+    ]
+    for m, d, note in oai_models:
+        typer.echo(f"  {m:<48} {d:<6}  {note}")
+    typer.echo()
+
+
 @app.command()
 def index(
     path: str = typer.Argument(..., help="File or directory to index"),
@@ -55,9 +128,17 @@ def index(
     extensions: Optional[str] = typer.Option(
         None, "--ext", help="Comma-separated extensions, e.g. .md,.py"
     ),
+    provider: Optional[str] = typer.Option(None, "--provider", "-p", help=PROVIDER_HELP),
+    model: Optional[str] = typer.Option(None, "--model", "-m", help=MODEL_HELP),
 ):
-    """Index files into a vector database."""
-    vdb = _get_db(db)
+    """
+    Index files into a vector database.
+
+    If the database doesn't exist yet, it will be created with the specified
+    provider (defaults to sentence-transformers/all-MiniLM-L6-v2).
+    If it already exists, the stored provider is used automatically.
+    """
+    vdb = _get_db(db, provider, model)
     p = Path(path).expanduser()
     exts = set(extensions.split(",")) if extensions else None
 
@@ -143,16 +224,26 @@ def deploy(
 
 @app.command("list-dbs")
 def list_dbs():
-    """List all available vector databases."""
+    """List all available vector databases with their embedding providers."""
     if not BASE_DIR.exists():
         typer.echo("No databases found.")
         return
     dbs = sorted({f.stem for f in BASE_DIR.glob("*.tvim")})
     if not dbs:
-        typer.echo("No databases found. Run: turbovec index <path>")
+        typer.echo("No databases found. Run: python cli.py create-db <name>")
         return
     for name in dbs:
-        typer.echo(f"  • {name}")
+        meta_file = (BASE_DIR / name).with_suffix(".json")
+        emb_info = ""
+        if meta_file.exists():
+            try:
+                raw = json.loads(meta_file.read_text(encoding="utf-8"))
+                emb = raw.get("embedding", {})
+                if emb:
+                    emb_info = f"  [{emb.get('provider','?')} / {emb.get('model','?')}  dim={emb.get('dim','?')}]"
+            except Exception:
+                pass
+        typer.echo(f"  • {name}{emb_info}")
 
 
 @app.command()
